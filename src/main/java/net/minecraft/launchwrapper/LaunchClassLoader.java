@@ -29,7 +29,8 @@ public class LaunchClassLoader extends URLClassLoader {
 
     private List<IClassTransformer> transformers = new ArrayList<>(2);
     private Map<String, Class<?>> cachedClasses = new ConcurrentHashMap<>();
-    private Map<String, ClassNotFoundException> invalidClasses = new HashMap<>(1000);
+    private Set<String> invalidClasses = new HashSet<>(1000);
+    private Map<String, ClassNotFoundException> invalidClassExceptions = new HashMap<>(1000);
 
     private FileSystem cacheFileSystem;
     private CachedClassInfo cachedClassInfo;
@@ -191,9 +192,8 @@ public class LaunchClassLoader extends URLClassLoader {
 
     @Override
     public Class<?> findClass(final String name) throws ClassNotFoundException {
-        ClassNotFoundException previousException = invalidClasses.get(name);
-        if (previousException != null) {
-            throw new ClassPreviouslyNotFoundException(name, previousException);
+        if (invalidClasses.contains(name)) {
+            throw new ClassPreviouslyNotFoundException(name, invalidClassExceptions.get(name));
         }
 
         for (final String exception : classLoaderExceptions) {
@@ -213,7 +213,8 @@ public class LaunchClassLoader extends URLClassLoader {
                     cachedClasses.put(name, clazz);
                     return clazz;
                 } catch (ClassNotFoundException e) {
-                    invalidClasses.put(name, e);
+                    invalidClasses.add(name);
+                    invalidClassExceptions.put(name, e);
                     throw e;
                 }
             }
@@ -338,7 +339,8 @@ public class LaunchClassLoader extends URLClassLoader {
             return clazz;
         } catch (Throwable e) {
             ClassNotFoundException classNotFoundException = new ClassNotFoundException(name, e);
-            invalidClasses.put(name, classNotFoundException);
+            invalidClasses.add(name);
+            invalidClassExceptions.put(name, classNotFoundException);
             if (DEBUG) {
                 LOGGER.error("Exception encountered attempting classloading of {}", name, e);
             }
