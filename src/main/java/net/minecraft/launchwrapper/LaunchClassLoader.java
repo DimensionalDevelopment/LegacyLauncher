@@ -7,6 +7,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.*;
 import java.net.*;
+import java.nio.file.FileSystem;
 import java.nio.file.*;
 import java.security.CodeSigner;
 import java.security.CodeSource;
@@ -303,6 +304,7 @@ public class LaunchClassLoader extends URLClassLoader {
                     } else {
                         transformedClass = getFromCache(transformedClassHash);
                     }
+                    MixinSupport.onCachedClassLoad();
 
                 } catch (Throwable t) {
                     LOGGER.error("Failed to read cached class {}", name, t);
