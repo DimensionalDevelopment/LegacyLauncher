@@ -129,13 +129,17 @@ public class LaunchClassLoader extends URLClassLoader {
             Adler32 adler32 = new Adler32();
 
             File modsFolder = new File(Launch.minecraftHome, "mods");
-            for (File modFile : modsFolder.listFiles()) {
-                if (modFile.isFile()) {
-                    adler32.update(Files.readAllBytes(modFile.toPath()));
+            if (modsFolder.exists()) {
+                for (File modFile : modsFolder.listFiles()) {
+                    if (modFile.isFile()) {
+                        adler32.update(Files.readAllBytes(modFile.toPath()));
+                    }
                 }
-            }
 
-            result = adler32.getValue();
+                result = adler32.getValue();
+            } else {
+                result = 0;
+            }
         } catch (IOException e1) {
             throw new RuntimeException(e1);
         }
