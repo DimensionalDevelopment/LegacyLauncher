@@ -2,6 +2,7 @@ package net.minecraft.launchwrapper;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import org.apache.commons.io.IOUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -13,11 +14,7 @@ import java.security.CodeSigner;
 import java.security.CodeSource;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.jar.Attributes;
-import java.util.jar.Attributes.Name;
-import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
-import java.util.jar.Manifest;
 import java.util.zip.Adler32;
 
 public class LaunchClassLoader extends URLClassLoader {
@@ -38,21 +35,18 @@ public class LaunchClassLoader extends URLClassLoader {
 
     private Set<String> classLoaderExceptions = new HashSet<>();
     private Set<String> transformerExceptions = new HashSet<>();
-    private Map<String, byte[]> resourceCache = new ConcurrentHashMap<>(1000);
     private Set<String> negativeResourceCache = Collections.newSetFromMap(new ConcurrentHashMap<>());
     private Map<IClassTransformer, Long> transformerTimings;
 
     private IClassNameTransformer renameTransformer;
-
-    private final ThreadLocal<byte[]> loadBuffer = new ThreadLocal<>();
-
-    private static final String[] RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"};
 
     private static final boolean DEBUG = Boolean.parseBoolean(System.getProperty("legacy.debugClassLoading", "false"));
     private static final boolean DEBUG_FINER = DEBUG && Boolean.parseBoolean(System.getProperty("legacy.debugClassLoadingFiner", "false"));
     private static final boolean DEBUG_SAVE = DEBUG && Boolean.parseBoolean(System.getProperty("legacy.debugClassLoadingSave", "false"));
     private static final boolean TIMINGS_ENABLED = Boolean.parseBoolean(System.getProperty("legacy.timings", "true"));
     private static File tempFolder = null;
+
+    private boolean mixinLoaded = false;
 
     public LaunchClassLoader(URL[] sources) {
         super(sources, null);
@@ -103,7 +97,7 @@ public class LaunchClassLoader extends URLClassLoader {
         Map<String, String> env = new HashMap<>();
         env.put("create", "true");
         try {
-            URI classCachesURI = classCachesZip.toURI(); // here
+            URI classCachesURI = classCachesZip.toURI();
             URI classCachesZipURI = new URI("jar:" + classCachesURI.getScheme(), classCachesURI.getPath(), null);
             cacheFileSystem = FileSystems.newFileSystem(classCachesZipURI, env, null);
         } catch (Throwable t) {
@@ -111,7 +105,7 @@ public class LaunchClassLoader extends URLClassLoader {
                 LOGGER.error("Failed to read class caches", t);
                 try {
                     classCachesZip.delete();
-                    URI classCachesURI = classCachesZip.toURI(); // here
+                    URI classCachesURI = classCachesZip.toURI();
                     URI classCahcesZipURI = new URI("jar:" + classCachesURI.getScheme(), classCachesURI.getPath(), null);
                     cacheFileSystem = FileSystems.newFileSystem(classCahcesZipURI, env, null);
                 } catch (IOException | URISyntaxException e) {
@@ -201,6 +195,10 @@ public class LaunchClassLoader extends URLClassLoader {
             throw new ClassPreviouslyNotFoundException(name, invalidClassExceptions.get(name));
         }
 
+        if (name.equals("org.spongepowered.asm.mixin.transformer.Proxy")) {
+            mixinLoaded = true;
+        }
+
         for (final String exception : classLoaderExceptions) {
             if (name.startsWith(exception)) {
                 return parent.loadClass(name);
@@ -232,57 +230,29 @@ public class LaunchClassLoader extends URLClassLoader {
                 cachedClassInfo.transformedClassNames.put(name, transformedName);
             }
 
-            if (cachedClasses.containsKey(transformedName)) {
-                return cachedClasses.get(transformedName);
-            }
-
             String untransformedName = cachedClassInfo.untransformedClassNames.get(name);
             if (untransformedName == null) {
                 untransformedName = untransformName(name);
                 cachedClassInfo.untransformedClassNames.put(name, untransformedName);
             }
 
-            final int lastDot = untransformedName.lastIndexOf('.');
-            final String packageName = lastDot == -1 ? "" : untransformedName.substring(0, lastDot);
             final String fileName = untransformedName.replace('.', '/').concat(".class");
             URLConnection urlConnection = findCodeSourceConnectionFor(fileName);
 
-            CodeSigner[] signers = null;
-
-            if (lastDot > -1 && !untransformedName.startsWith("net.minecraft.")) {
-                if (urlConnection instanceof JarURLConnection) {
-                    final JarURLConnection jarURLConnection = (JarURLConnection) urlConnection;
-                    final JarFile jarFile = jarURLConnection.getJarFile();
-
-                    if (jarFile != null && jarFile.getManifest() != null) {
-                        final Manifest manifest = jarFile.getManifest();
-                        final JarEntry entry = jarFile.getJarEntry(fileName);
-
-                        Package pkg = getPackage(packageName);
-                        getClassBytes(untransformedName);
-                        signers = entry.getCodeSigners();
-                        if (pkg == null) {
-                            definePackage(packageName, manifest, jarURLConnection.getJarFileURL());
-                        } else {
-                            if (pkg.isSealed() && !pkg.isSealed(jarURLConnection.getJarFileURL())) {
-                                LOGGER.fatal("The jar file {} is trying to seal already secured path {}", jarFile.getName(), packageName);
-                            } else if (isSealed(packageName, manifest)) {
-                                LOGGER.fatal("The jar file {} has a security seal for path {}, but that path is defined and not secure", jarFile.getName(), packageName);
-                            }
-                        }
-                    }
-                } else {
-                    Package pkg = getPackage(packageName);
-                    if (pkg == null) {
-                        definePackage(packageName, null, null, null, null, null, null, null);
-                    } else if (pkg.isSealed()) {
-                        LOGGER.error("The URL {} is defining elements for sealed path {}", urlConnection.getURL(), packageName);
-                    }
-                }
-            }
 
             // Get class bytes
             byte[] untransformedClass = getClassBytes(untransformedName);
+
+            // Get signers
+            CodeSigner[] signers = null;
+            if (untransformedName.indexOf('.') > -1 && !untransformedName.startsWith("net.minecraft.")) {
+                if (urlConnection instanceof JarURLConnection) {
+                    final JarFile jarFile = ((JarURLConnection) urlConnection).getJarFile();
+                    if (jarFile != null && jarFile.getManifest() != null) {
+                        signers = jarFile.getJarEntry(fileName).getCodeSigners();
+                    }
+                }
+            }
 
             if (untransformedClass == null) {
                 byte[] transformedClass = runTransformers(untransformedName, transformedName, untransformedClass);
@@ -308,8 +278,8 @@ public class LaunchClassLoader extends URLClassLoader {
                     } else {
                         transformedClass = getFromCache(transformedClassHash);
                     }
-                    MixinSupport.onCachedClassLoad();
 
+                    if (mixinLoaded) MixinSupport.onCachedClassLoad();
                 } catch (Throwable t) {
                     LOGGER.error("Failed to read cached class {}", name, t);
                 }
@@ -425,22 +395,6 @@ public class LaunchClassLoader extends URLClassLoader {
         return name;
     }
 
-    private boolean isSealed(final String path, final Manifest manifest) {
-        Attributes attributes = manifest.getAttributes(path);
-        String sealed = null;
-        if (attributes != null) {
-            sealed = attributes.getValue(Name.SEALED);
-        }
-
-        if (sealed == null) {
-            attributes = manifest.getMainAttributes();
-            if (attributes != null) {
-                sealed = attributes.getValue(Name.SEALED);
-            }
-        }
-        return "true".equalsIgnoreCase(sealed);
-    }
-
     private URLConnection findCodeSourceConnectionFor(final String name) {
         final URL resource = findResource(name);
         if (resource != null) {
@@ -491,41 +445,6 @@ public class LaunchClassLoader extends URLClassLoader {
         return sources;
     }
 
-    private byte[] readFully(InputStream stream) {
-        try {
-            byte[] buffer = getOrCreateBuffer();
-
-            int read;
-            int totalLength = 0;
-            while ((read = stream.read(buffer, totalLength, buffer.length - totalLength)) != -1) {
-                totalLength += read;
-
-                // Extend our buffer
-                if (totalLength >= buffer.length - 1) {
-                    byte[] newBuffer = new byte[buffer.length + BUFFER_SIZE];
-                    System.arraycopy(buffer, 0, newBuffer, 0, buffer.length);
-                    buffer = newBuffer;
-                }
-            }
-
-            final byte[] result = new byte[totalLength];
-            System.arraycopy(buffer, 0, result, 0, totalLength);
-            return result;
-        } catch (Throwable t) {
-            LOGGER.warn("Problem loading class", t);
-            return new byte[0];
-        }
-    }
-
-    private byte[] getOrCreateBuffer() {
-        byte[] buffer = loadBuffer.get();
-        if (buffer == null) {
-            loadBuffer.set(new byte[BUFFER_SIZE]);
-            buffer = loadBuffer.get();
-        }
-        return buffer;
-    }
-
     public List<IClassTransformer> getTransformers() {
         return Collections.unmodifiableList(transformers);
     }
@@ -545,49 +464,20 @@ public class LaunchClassLoader extends URLClassLoader {
     public byte[] getClassBytes(String name) throws IOException {
         if (negativeResourceCache.contains(name)) {
             return null;
-        } else if (resourceCache.containsKey(name)) {
-            return resourceCache.get(name);
-        }
-        if (name.indexOf('.') == -1) {
-            for (final String reservedName : RESERVED_NAMES) {
-                if (name.toUpperCase(Locale.ENGLISH).startsWith(reservedName)) {
-                    final byte[] data = getClassBytes("_" + name);
-                    if (data != null) {
-                        resourceCache.put(name, data);
-                        return data;
-                    }
-                }
-            }
         }
 
-        InputStream classStream = null;
-        try {
-            final String resourcePath = name.replace('.', '/').concat(".class");
-            final URL classResource = findResource(resourcePath);
+        final String resourcePath = name.replace('.', '/').concat(".class");
+        final URL classResource = findResource(resourcePath);
 
-            if (classResource == null) {
-                if (DEBUG) LOGGER.trace("Failed to find class resource {}", resourcePath);
-                negativeResourceCache.add(name);
-                return null;
-            }
-            classStream = classResource.openStream();
-
-            if (DEBUG) LOGGER.trace("Loading class {} from resource {}", name, classResource.toString());
-            final byte[] data = readFully(classStream);
-            resourceCache.put(name, data);
-            return data;
-        } finally {
-            closeSilently(classStream);
+        if (classResource == null) {
+            if (DEBUG) LOGGER.trace("Failed to find class resource {}", resourcePath);
+            negativeResourceCache.add(name);
+            return null;
         }
-    }
 
-    private static void closeSilently(Closeable closeable) {
-        if (closeable != null) {
-            try {
-                closeable.close();
-            } catch (IOException ignored) {
-            }
-        }
+        if (DEBUG) LOGGER.trace("Loading class {} from resource {}", name, classResource.toString());
+
+        return IOUtils.toByteArray(classResource.openStream());
     }
 
     public void clearNegativeEntries(Set<String> entriesToClear) {

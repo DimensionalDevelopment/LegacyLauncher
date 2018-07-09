@@ -6,6 +6,7 @@ import org.spongepowered.asm.mixin.MixinEnvironment;
 import org.spongepowered.asm.mixin.Mixins;
 import org.spongepowered.asm.mixin.transformer.MixinTransformer;
 import org.spongepowered.asm.mixin.transformer.Proxy;
+import org.spongepowered.asm.util.ReEntranceLock;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -34,12 +35,23 @@ public class MixinSupport {
 
         MixinEnvironment currentEnvironment = MixinEnvironment.getCurrentEnvironment();
         if (currentEnvironment != lastEnvironment || Mixins.getUnvisitedCount() > 0) {
-            LOGGER.info("Notifying Mixin of environment change " +
-                        (lastEnvironment == null ? "null" : lastEnvironment.toString()) + " -> " +
-                        (currentEnvironment == null ?  "null" : currentEnvironment));
-            Method selectConfigsMethod = MixinTransformer.class.getDeclaredMethod("checkSelect", MixinEnvironment.class);
-            selectConfigsMethod.setAccessible(true);
-            selectConfigsMethod.invoke(mixinTransformer, currentEnvironment);
+            Field lockField = MixinTransformer.class.getDeclaredField("lock");
+            lockField.setAccessible(true);
+            ReEntranceLock lock = (ReEntranceLock) lockField.get(mixinTransformer);
+
+            boolean locked = lock.push().check();
+            try {
+                if (!locked) {
+                    LOGGER.info("Notifying Mixin of environment change " +
+                                (lastEnvironment == null ? "null" : lastEnvironment.toString()) + " -> " +
+                                (currentEnvironment == null ? "null" : currentEnvironment));
+                    Method selectConfigsMethod = MixinTransformer.class.getDeclaredMethod("checkSelect", MixinEnvironment.class);
+                    selectConfigsMethod.setAccessible(true);
+                    selectConfigsMethod.invoke(mixinTransformer, currentEnvironment);
+                }
+            } finally {
+                lock.pop();
+            }
         }
 
         lastEnvironment = currentEnvironment;
